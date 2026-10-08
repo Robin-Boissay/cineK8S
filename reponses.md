@@ -409,4 +409,27 @@ Après ces 3 corrections successives, le Pod `ticket-debug` est bien passé en s
 
 ## Partie 7 — Questions de synthèse
 
-*(à venir)*
+> **Q7.1** — Décrivez ce qui se passe, étape par étape, quand un Pod `ticket` exécute `GET http://movie:8080/api/movies/1` : qui résout le nom `movie` ? en quoi ? comment la requête atteint-elle *un* Pod `movie` précis ?
+
+1. **Résolution DNS :** Le Pod `ticket` interroge le DNS interne du cluster (**CoreDNS**, configuré via `/etc/resolv.conf`). CoreDNS résout le nom court `movie` (complété automatiquement en FQDN `movie.cinema-exam.svc.cluster.local`) en l'adresse IP virtuelle (**ClusterIP**) du Service `movie`.
+2. **Routage et équilibrage :** Lorsque le paquet TCP est émis vers cette ClusterIP sur le port 8080, le composant **kube-proxy** (via les règles `iptables` ou `IPVS` au niveau du noyau Linux) intercepte le trafic et sélectionne l'adresse IP privée de l'un des Pods sains listés dans les `Endpoints` du Service `movie` en effectuant un DNAT (*Destination NAT*).
+3. **Acheminement au Pod :** Le paquet est ensuite routé via le réseau CNI du cluster directement vers l'interface réseau du Pod `movie` sélectionné, qui traite la requête HTTP et renvoie les données.
+
+---
+
+> **Q7.2** — Créez 4 réservations puis lancez plusieurs fois `curl -s http://cinema.local/api/tickets | jq length`. Le nombre varie d'un appel à l'autre. **Pourquoi ?** Que se passe-t-il si vous supprimez les Pods `ticket` ? Quelle est la solution **architecturale** (pas une astuce) ?
+
+- **Pourquoi le nombre varie :** Le contrôleur `TicketController` stocke l'état des réservations dans une liste locale **en mémoire vive** propre à chaque JVM (`CopyOnWriteArrayList`). Comme il y a 2 réplicas de `ticket` et que l'Ingress/Service distribue les requêtes entre eux, chaque Pod ne possède et ne renvoie que les tickets qu'il a lui-même enregistrés.
+- **Si les Pods sont supprimés :** La mémoire vive étant volatile, **toutes les réservations sont irrémédiablement perdues** lors de l'arrêt ou du redémarrage d'un Pod.
+- **Solution architecturale :** Rendre le service **stateless** (sans état en mémoire) en déportant la persistance des données vers une source de stockage externe partagée (base de données relationnelle comme PostgreSQL/MySQL, ou base clé-valeur / cache distribué comme Redis), accessible par tous les réplicas de manière cohérente.
+
+---
+
+> **Q7.3** — Supprimez un Pod `movie` à la main (`kubectl delete pod ...`). Que constatez-vous ? Qu'auriez-vous perdu si vous aviez déployé un `kind: Pod` « nu » à la place d'un `Deployment` ?
+
+- **Constat :** Dès la suppression du Pod, un nouveau Pod `movie` est **instantanément recréé** par le `ReplicaSet` afin de maintenir en permanence l'état désiré (`replicas: 2`).
+- **Ce qu'on aurait perdu avec un Pod nu (`kind: Pod`) :**
+  Un Pod nu n'est managé par aucun contrôleur. S'il est supprimé, s'il crashe ou si son nœud tombe en panne, il est **définitivement perdu** (*aucun self-healing*). De plus, on perdrait :
+  - La gestion déclarative du nombre de réplicas et le scaling (`kubectl scale`).
+  - Les stratégies de mise à jour sans coupure de service (`RollingUpdate`).
+  - L'historique des déploiements et la possibilité de retour arrière immédiat (`rollout undo`).
