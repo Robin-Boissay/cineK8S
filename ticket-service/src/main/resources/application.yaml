@@ -1,0 +1,16 @@
+server:
+  port: 8086
+  shutdown: graceful
+
+movie:
+  url: http://localhost:8080   # en local ; dans Kubernetes, ce sera surchargé
+
+management:
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,movie

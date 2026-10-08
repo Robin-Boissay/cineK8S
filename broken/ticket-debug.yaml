@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ticket-debug
+  namespace: cinema-exam
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ticket-debug }
+  template:
+    metadata:
+      labels: { app: ticket-debug }
+    spec:
+      containers:
+        - name: ticket
+          image: ticket-service:1.0.0
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: ticket-configmap
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: 8081 }
+            periodSeconds: 5

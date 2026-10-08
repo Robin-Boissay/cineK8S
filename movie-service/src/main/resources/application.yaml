@@ -1,0 +1,13 @@
+server:
+  port: 8085
+  shutdown: graceful          # laisse finir les requêtes en cours lors d'un rolling update
+
+movie:
+  environment: local          # valeur par défaut, utilisée en local
+
+management:
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true         # active /actuator/health/liveness et /actuator/health/readiness
