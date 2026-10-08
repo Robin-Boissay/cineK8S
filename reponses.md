@@ -144,7 +144,29 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8082/api/tickets \
 
 ## Partie 3 — Conteneuriser
 
-*(à venir)*
+### 3.3 — Questions
+
+> **Q3.1** — Pourquoi copie-t-on `pom.xml` **avant** `src/` dans le Dockerfile ? Que se passe-t-il quand vous ne modifiez qu'une ligne de Java ?
+
+- **Pourquoi :** Docker met en cache le résultat de chaque instruction (`layer cache`). Les dépendances Maven déclarées dans le `pom.xml` changent beaucoup moins fréquemment que le code métier dans `src/`. En copiant d'abord le `pom.xml` seul et en exécutant `mvn dependency:go-offline`, on crée une couche de cache contenant toutes les dépendances téléchargées.
+- **Lors d'une modification de code :** Si l'on modifie seulement une ligne de code Java dans `src/`, la couche du `pom.xml` et le téléchargement des dépendances restent valides en cache. Docker réutilise ce cache et ne réexécute que la copie de `src/` et le `mvn package -DskipTests`, ce qui accélère considérablement le build (quelques secondes au lieu de plusieurs minutes à retélécharger toutes les dépendances).
+
+---
+
+> **Q3.2** — Pourquoi `-XX:MaxRAMPercentage=75` est-il préférable à `-Xmx512m` dans un conteneur ?
+
+- `-Xmx512m` fixe une valeur maximale absolue en dur. Si l'on change les limites de mémoire du conteneur (par exemple à 256Mi dans Kubernetes), la JVM tentera d'allouer plus de mémoire que la limite imposée par le cgroup du conteneur, provoquant un arrêt brutal par le kernel Linux (`OOMKilled`). À l'inverse, si on alloue 2Go au conteneur, `-Xmx512m` n'en exploitera qu'un quart sans s'adapter.
+- `-XX:MaxRAMPercentage=75` rend la JVM adaptative et consciente des limites du conteneur (*container-aware*) : elle calcule dynamiquement son heap maximum à 75 % de la limite mémoire allouée au conteneur (par Docker ou Kubernetes). Les 25 % restants sont automatiquement réservés pour la mémoire hors-heap (Metaspace, threads stack, code cache, buffers natifs), évitant ainsi tout dépassement fatal de la mémoire totale du conteneur.
+
+---
+
+> **Q3.3** — Compose a `depends_on: condition: service_healthy`. Kubernetes n'a **pas** d'équivalent direct. Que se passe-t-il, dans Kubernetes, si les Pods `ticket` démarrent **avant** les Pods `movie` ?
+
+- Dans Kubernetes, les Pods démarrent de manière indépendante et asynchrone. Si les Pods `ticket` démarrent en premier :
+  1. Le conteneur `ticket` se lance et sa **liveness probe** est validée dès que Spring Boot est vivant en interne (aucun redémarrage en boucle).
+  2. En revanche, sa **readiness probe** échoue car `MovieHealthIndicator` ne parvient pas à joindre `http://movie:8080/actuator/health/liveness`.
+  3. Tant que `movie` n'est pas prêt, le Pod `ticket` reste en statut `0/1 Ready` et Kubernetes refuse de l'ajouter aux Endpoints de son Service, protégeant les clients en ne leur acheminant aucun trafic.
+  4. Dès que les Pods `movie` sont prêts et que le Service `movie` répond, la probe de `ticket` passe automatiquement au vert (`1/1 Ready`), et le trafic commence à être routé normalement.
 
 ---
 
