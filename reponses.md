@@ -433,3 +433,62 @@ Après ces 3 corrections successives, le Pod `ticket-debug` est bien passé en s
   - La gestion déclarative du nombre de réplicas et le scaling (`kubectl scale`).
   - Les stratégies de mise à jour sans coupure de service (`RollingUpdate`).
   - L'historique des déploiements et la possibilité de retour arrière immédiat (`rollout undo`).
+
+---
+
+## ⭐ Bonus — Durcir et fiabiliser
+
+### ⭐ B1 — Durcir le Deployment `movie`
+
+Le manifest `k8s/20-movie.yaml` a été enrichi d'un `securityContext` strict au niveau du conteneur :
+- `runAsNonRoot: true` et `runAsUser: 10001` (UID spring).
+- `allowPrivilegeEscalation: false` (interdiction d'élévation de privilèges).
+- `capabilities.drop: ["ALL"]` (suppression de toutes les capabilities Linux).
+- `readOnlyRootFilesystem: true` (système de fichiers racine en lecture seule).
+- Ajout d'un volume `emptyDir` monté sur `/tmp` pour permettre à Tomcat d'écrire ses fichiers temporaires nécessaires.
+
+#### Vérifications :
+- Vérification du user non-root :
+  ```bash
+  kubectl exec deploy/movie -- id
+  ```
+  ```text
+  uid=10001(spring) gid=101(spring) groups=101(spring)
+  ```
+- Vérification du système de fichiers en lecture seule :
+  ```bash
+  kubectl exec deploy/movie -- touch /test
+  ```
+  ```text
+  touch: cannot touch '/test': Read-only file system
+  ```
+- Les Pods restent stables et opérationnels en statut **`1/1 Running`**.
+
+---
+
+### ⭐ B2 — Rolling update sans coupure
+
+La stratégie de déploiement a été configurée dans `k8s/20-movie.yaml` :
+```yaml
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+```
+
+Sortie du test pendant un `kubectl rollout restart deploy/movie` :
+```bash
+for i in $(seq 1 120); do curl -s -o /dev/null -w '%{http_code}\n' http://cinema.local/api/movies; sleep 0.2; done | sort | uniq -c
+```
+```text
+120 200
+```
+
+> **QB2** — Quel est le résultat ? Quels trois éléments (`strategy`, `readinessProbe`, `shutdown: graceful`) y contribuent, et comment ?
+
+- **Résultat observé :** **100 % de codes HTTP `200 OK`**, sans aucune erreur, coupure ni requête rejetée pendant toute la durée du redémarrage.
+- **Rôle des 3 éléments :**
+  1. **`strategy: RollingUpdate` (`maxUnavailable: 0`, `maxSurge: 1`) :** Garantit qu'à aucun moment la capacité de service ne diminue en dessous de 2 réplicas. Kubernetes crée d'abord un nouveau Pod supplémentaire avant d'envisager la suppression d'un ancien Pod.
+  2. **`readinessProbe` :** Empêche Kubernetes d'ajouter le nouveau Pod aux Endpoints et d'arrêter un ancien Pod tant que la nouvelle instance Spring Boot n'a pas validé `/actuator/health/readiness` (démarrage complet du serveur Tomcat et initialisation de l'API). Le basculement de trafic n'a lieu que lorsque le nouveau Pod est réellement prêt.
+  3. **`server.shutdown: graceful` :** Lors de la réception du signal d'extinction (`SIGTERM`), Spring Boot cesse d'accepter de nouvelles requêtes mais attend la fin de l'exécution de toutes les requêtes HTTP déjà en cours de traitement, évitant ainsi d'interrompre brutalement des requêtes clientes (erreurs 502 / Bad Gateway).
