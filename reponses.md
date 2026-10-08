@@ -45,9 +45,100 @@ Lors d'un rolling update, le graceful shutdown permet au conteneur en cours d'ar
 
 ## Partie 2 — Tester en local, sans Kubernetes
 
+### 2.1 — Lancer les deux services
+
+Sortie de la réservation (`POST /api/tickets`) :
+```bash
+curl -s -X POST localhost:8082/api/tickets \
+  -H 'Content-Type: application/json' \
+  -d '{"movieId":2,"seats":3}' | jq
 ```
-(à compléter lors de la partie 2)
+```json
+{
+  "id": 1,
+  "movieId": 2,
+  "movieTitle": "Le Seigneur des Pods",
+  "seats": 3,
+  "total": 36.00,
+  "createdAt": "2026-10-08T09:05:58.842185084Z"
+}
 ```
+
+Sortie de la readiness (`GET /actuator/health/readiness`) :
+```bash
+curl -s localhost:8082/actuator/health/readiness | jq
+```
+```json
+{
+  "status": "UP",
+  "components": {
+    "movie": {
+      "status": "UP"
+    },
+    "readinessState": {
+      "status": "UP"
+    }
+  }
+}
+```
+
+---
+
+### 2.2 — Couper `movie-service`
+
+Sortie de la readiness avec `movie-service` arrêté :
+```bash
+curl -s localhost:8082/actuator/health/readiness | jq
+```
+```json
+{
+  "status": "DOWN",
+  "components": {
+    "movie": {
+      "status": "DOWN",
+      "details": {
+        "error": "I/O error on GET request for \"http://localhost:8080/actuator/health/liveness\": null"
+      }
+    },
+    "readinessState": {
+      "status": "UP"
+    }
+  }
+}
+```
+
+Sortie de la liveness :
+```bash
+curl -s localhost:8082/actuator/health/liveness | jq .status
+```
+```json
+"UP"
+```
+
+Code HTTP lors d'une tentative de réservation :
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8082/api/tickets \
+  -H 'Content-Type: application/json' -d '{"movieId":2,"seats":3}'
+```
+```text
+503
+```
+
+---
+
+### 2.3 — Questions
+
+> **Q2.1** — Pourquoi lance-t-on `ticket-service` avec `SERVER_PORT=8082` plutôt qu'en modifiant `application.yaml` ? Quel mécanisme Spring Boot rend cela possible ?
+
+- **Pourquoi :** Cela permet d'éviter un conflit de port en local avec `movie-service` (qui écoute sur le port 8080) sans modifier les fichiers de code source ou de configuration versionnés (`application.yaml`). Cela respecte les principes *12-Factor App* (séparation configuration / code) et garantit que le fichier `application.yaml` reste prêt pour la conteneurisation et Kubernetes (où chaque service tourne dans son propre Pod / conteneur isolé et écoute sur le port standard 8080).
+- **Mécanisme Spring Boot :** L'**externalisation de configuration** (*Externalized Configuration*) combinée au **relaxed binding**. Les variables d'environnement système ont une priorité plus élevée que les fichiers `application.yaml` dans l'ordre d'évaluation de Spring Boot, et la variable `SERVER_PORT` est automatiquement liée à la propriété `server.port`.
+
+---
+
+> **Q2.2** — Dans l'étape 2.2, la liveness est restée `UP` alors que la readiness est passée `DOWN`. Pourquoi est-ce exactement le comportement voulu ?
+
+- **Liveness à `UP` :** La liveness indique si le processus applicatif interne est en vie et sain (JVM active, pas de deadlock, thread principal réactif). Puisque le processus `ticket-service` fonctionne parfaitement, il ne doit surtout pas être tué ni redémarré (un redémarrage ne réparerait pas `movie-service` et créerait une boucle de redémarrage inutile).
+- **Readiness à `DOWN` :** La readiness indique si le service est prêt à traiter convenablement les requêtes des clients. Puisque la dépendance indispensable `movie-service` est indisponible, `ticket-service` ne peut pas honorer les réservations. Passer à `DOWN` permet (dans Kubernetes) de retirer immédiatement le Pod des cibles du Service afin qu'aucun trafic ne lui soit acheminé tant que la dépendance n'est pas rétablie.
 
 ---
 
