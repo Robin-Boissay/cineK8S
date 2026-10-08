@@ -243,13 +243,167 @@ curl -s -X POST localhost:8082/api/tickets -H 'Content-Type: application/json' \
 
 ## Partie 5 — Exposer avec un Ingress
 
-*(à venir)*
+### 5.3 — Tests via l'Ingress
+
+Liste des films (`GET http://cinema.local/api/movies`) :
+```bash
+curl -s http://cinema.local/api/movies | jq '.[].title'
+```
+```text
+"Pod Fiction"
+"Le Seigneur des Pods"
+"Docker Wars"
+"Rollback to the Future"
+```
+
+Réservation de places (`POST http://cinema.local/api/tickets`) :
+```bash
+curl -s -X POST http://cinema.local/api/tickets -H 'Content-Type: application/json' \
+  -d '{"movieId":3,"seats":10}' | jq
+```
+```json
+{
+  "id": 2,
+  "movieId": 3,
+  "movieTitle": "Docker Wars",
+  "seats": 10,
+  "total": 90.00,
+  "createdAt": "2026-10-08T10:17:50.519331987Z"
+}
+```
+
+Load-balancing observé sur `whoami` :
+```bash
+for i in $(seq 1 6); do curl -s http://cinema.local/api/movies/whoami | jq -r .hostname; done
+```
+```text
+movie-59684459f4-xddfz
+movie-59684459f4-xddfz
+movie-59684459f4-bjg7z
+movie-59684459f4-bjg7z
+movie-59684459f4-xddfz
+movie-59684459f4-xddfz
+```
+
+Test d'accès à Actuator via Ingress :
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://cinema.local/actuator/health
+```
+```text
+404
+```
+
+---
+
+### 5.4 — Questions
+
+> **Q5.1** — Combien de Pods `movie` distincts ont répondu dans la boucle ? Quel objet Kubernetes répartit la charge entre eux ?
+
+- **Nombre de Pods :** Deux Pods distincts ont répondu (`movie-59684459f4-xddfz` et `movie-59684459f4-bjg7z`), conformément aux 2 réplicas configurés.
+- **Objet Kubernetes :** C'est le **Service Kubernetes** (`movie`) en combinaison avec l'**Ingress Controller** (`ingress-nginx`). L'Ingress Controller route le trafic HTTP externe vers le Service, et les mécanismes de routage de Kubernetes (Endpoints / EndpointSlices gérés par kube-proxy avec iptables/IPVS) répartissent la charge entre les Pods cibles.
+
+---
+
+> **Q5.2** — Que se passerait-il pour `GET /api/movies/1` si vous aviez mis `pathType: Exact` sur `/api/movies` ?
+
+- Avec `pathType: Exact`, l'Ingress ne transmet que les requêtes correspondant strictement et exactement à l'URI `/api/movies`.
+- Une requête comme `GET /api/movies/1` (ou `/api/movies/whoami`) ne correspondrait plus à cette règle exacte. L'Ingress Controller NGINX ne trouverait aucune route correspondante et renverrait un code d'erreur **`404 Not Found`**.
+- La valeur `pathType: Prefix` est donc nécessaire pour router l'ensemble des sous-chemins débutant par `/api/movies`.
+
+---
+
+> **Q5.3** — Quel code HTTP obtenez-vous pour `/actuator/health` via `cinema.local` ? Est-ce souhaitable ? Pourquoi ?
+
+- **Code HTTP obtenu :** `404 Not Found`.
+- **Est-ce souhaitable :** **Oui, c'est tout à fait souhaitable et recommandé.**
+- **Pourquoi :** Les endpoints Spring Boot Actuator (`/actuator/**`) exposent des données internes sensibles (santé détaillée, métriques, variables d'environnement, configuration du runtime). Ils sont réservés à l'infrastructure interne du cluster (les probes Kubernetes du kubelet, les systèmes de métriques Prometheus, etc.) et ne doivent **jamais** être accessibles publiquement depuis l'extérieur via l'Ingress, afin de protéger l'application contre les fuites d'informations et les risques d'attaques par déni de service.
 
 ---
 
 ## Partie 6 — Casser pour comprendre
 
-*(à venir)*
+### 6.1 — Le service `movie` disparaît
+
+#### Prédictions (avant commande) :
+- **(a) `READY` et `RESTARTS` des Pods `ticket` après 30 s :** `READY` passera à `0/1` et `RESTARTS` restera à `0`.
+- **(b) Contenu de `kubectl get endpoints ticket` :** Aucun endpoint actif (`<none>`).
+- **(c) Code HTTP de `GET http://cinema.local/api/tickets` :** `503 Service Temporarily Unavailable` (renvoyé par l'Ingress NGINX car aucun backend n'est prêt).
+- **(d) Statut de la liveness de `ticket` :** `"UP"` (la santé interne de Spring Boot reste saine).
+
+#### Observations réelles :
+
+Sortie de `kubectl get pods` après coupure de `movie` :
+```bash
+kubectl get pods
+```
+```text
+NAME                      READY   STATUS    RESTARTS   AGE
+ticket-66d95c98b6-729wj   0/1     Running   0          8m26s
+ticket-66d95c98b6-g68rh   0/1     Running   0          8m26s
+```
+
+Sortie de `kubectl get endpoints ticket` :
+```bash
+kubectl get endpoints ticket
+```
+```text
+NAME     ENDPOINTS   AGE
+ticket               8m38s
+```
+
+Requête via Ingress :
+```bash
+curl -si http://cinema.local/api/tickets | head -1
+```
+```text
+HTTP/1.1 503 Service Temporarily Unavailable
+```
+
+Événements constatés sur les Pods `ticket` :
+```bash
+kubectl describe pod -l app=ticket | grep -i "probe failed"
+```
+```text
+Warning  Unhealthy  kubelet  Readiness probe failed: HTTP probe failed with statuscode: 503
+```
+
+---
+
+#### Q6.1 — Explication en 4 étapes et analyse du statut RESTARTS :
+
+**Déroulement en 4 étapes :**
+1. **Suppression des Pods `movie` :** Le scaling de `deploy/movie` à 0 supprime tous les Pods `movie`. Les requêtes vers `http://movie:8080` échouent désormais (connexion refusée ou résolution DNS sans cible).
+2. **Échec de la readiness de `ticket` :** Le kubelet effectue périodiquement la `readinessProbe` sur `/actuator/health/readiness`. Le composant `MovieHealthIndicator` échoue à joindre `movie-service` et retourne `status: DOWN` (HTTP 503). Après 3 échecs consécutifs (`failureThreshold: 3`), le kubelet marque les Pods `ticket` en non prêts (`READY: 0/1`).
+3. **Retrait des Endpoints :** Le contrôleur d'Endpoints Kubernetes détecte que les Pods `ticket` sont `NotReady` et retire immédiatement leurs adresses IP de la liste des Endpoints du Service `ticket`.
+4. **Réponse 503 de l'Ingress :** Lors d'un appel vers `http://cinema.local/api/tickets`, l'Ingress Controller NGINX cherche un Pod sain dans le pool d'Endpoints du Service `ticket`. Constatant que la liste est vide, il renvoie immédiatement un code HTTP **`503 Service Temporarily Unavailable`**.
+
+**Pourquoi `RESTARTS` est resté à `0` :**
+La dépendance vers `movie-service` est surveillée exclusivement par la **`readinessProbe`** et non par la `livenessProbe`. La liveness probe a continué à sonder `/actuator/health/liveness`, qui vérifie uniquement la santé interne de la JVM et du contexte Spring Boot de `ticket-service` (resté `UP`). Comme la liveness ne détectait aucune anomalie interne, le kubelet n'avait aucune raison de tuer le conteneur, laissant le compteur `RESTARTS` à 0 et évitant un redémarrage en boucle inutile.
+
+---
+
+### 6.2 — Mission dépannage (`broken/ticket-debug.yaml`)
+
+Tableau de diagnostic et résolution des 3 erreurs successives :
+
+| # | Statut observé | Commande de diagnostic | Cause exacte | Correction apportée |
+|---|----------------|------------------------|--------------|---------------------|
+| 1 | `ErrImagePull` / `ImagePullBackOff` | `kubectl describe pod -l app=ticket-debug` | `imagePullPolicy: Always` force le kubelet à chercher l'image locale `ticket-service:1.0.0` sur le registre distant Docker Hub, où elle n'existe pas. | Remplacé `imagePullPolicy: Always` par `imagePullPolicy: IfNotPresent` dans `broken/ticket-debug.yaml`. |
+| 2 | `CreateContainerConfigError` | `kubectl describe pod -l app=ticket-debug` et `kubectl get cm` | `Error: configmap "ticket-configmap" not found`. Le manifest référençait une ConfigMap inexistante au lieu de `ticket-config`. | Remplacé `name: ticket-configmap` par `name: ticket-config` dans `envFrom.configMapRef`. |
+| 3 | `Running` mais `0/1 Ready` indéfiniment | `kubectl describe pod -l app=ticket-debug` | `Readiness probe failed: ... dial tcp ...:8081: connect: connection refused`. La probe interrogeait le port 8081 alors que Tomcat écoute sur 8080. | Remplacé `port: 8081` par `port: 8080` dans `readinessProbe.httpGet.port`. |
+
+Après ces 3 corrections successives, le Pod `ticket-debug` est bien passé en statut **`1/1 Running`**.
+
+---
+
+### 6.3 — Changer la configuration sans rebuild
+
+> **Q6.3** — Pourquoi la modification n'a-t-elle **pas** été prise en compte immédiatement ? Qu'est-ce qui l'a rendue effective ?
+
+- **Pourquoi pas immédiatement :**
+  Les valeurs de la ConfigMap sont injectées sous forme de **variables d'environnement** au moment de la création du conteneur (`envFrom: configMapRef`). Sous Linux et Kubernetes, les variables d'environnement d'un processus en cours d'exécution sont immuables. Modifier la ConfigMap dans Kubernetes met à jour la ressource dans etcd, mais n'altère en rien l'environnement du processus Java déjà en cours d'exécution dans les conteneurs existants.
+- **Ce qui l'a rendue effective :**
+  La commande `kubectl rollout restart deploy/movie` a déclenché un redémarrage progressif (*rolling update*) du déploiement. De nouveaux Pods ont été instanciés ; au moment de leur création, ils ont lu la version actualisée de la ConfigMap, injectant `MOVIE_ENVIRONMENT=production` dans leur environnement et dans le contexte Spring Boot au démarrage.
 
 ---
 
