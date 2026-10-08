@@ -172,7 +172,72 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8082/api/tickets \
 
 ## Partie 4 — Déployer sur Minikube
 
-*(à venir)*
+### 4.4 — Vérifications
+
+Sortie de `kubectl get pods` :
+```bash
+kubectl get pods
+```
+```text
+NAME                      READY   STATUS    RESTARTS   AGE
+movie-59684459f4-bjg7z    1/1     Running   0          78s
+movie-59684459f4-xddfz    1/1     Running   0          78s
+ticket-66d95c98b6-729wj   1/1     Running   0          78s
+ticket-66d95c98b6-g68rh   1/1     Running   0          78s
+```
+
+Sortie de `kubectl get endpoints` :
+```bash
+kubectl get endpoints movie ticket
+```
+```text
+NAME     ENDPOINTS                           AGE
+movie    10.244.0.24:8080,10.244.0.26:8080   102s
+ticket   10.244.0.25:8080,10.244.0.27:8080   102s
+```
+
+Réservation créée (`POST /api/tickets` via port-forward) :
+```bash
+curl -s -X POST localhost:8082/api/tickets -H 'Content-Type: application/json' \
+  -d '{"movieId":2,"seats":2}' | jq
+```
+```json
+{
+  "id": 1,
+  "movieId": 2,
+  "movieTitle": "Le Seigneur des Pods",
+  "seats": 2,
+  "total": 24.00,
+  "createdAt": "2026-10-08T10:14:10.666670672Z"
+}
+```
+
+---
+
+### 4.5 — Questions
+
+> **Q4.1** — `kubectl apply -f k8s/` traite les fichiers dans quel ordre ? En quoi les préfixes `00-`, `10-`, `20-`… sont-ils utiles ici ?
+
+- **Ordre de traitement :** `kubectl apply -f k8s/` parcourt les fichiers du répertoire dans l'**ordre alphabétique** (lexicographique) de leurs noms.
+- **Utilité des préfixes :** Les préfixes numériques imposent un ordre de création déterministe respectant les dépendances entre ressources :
+  1. `00-namespace.yaml` : crée d'abord le Namespace `cinema-exam`, indispensable car toutes les autres ressources y sont rattachées.
+  2. `10-config.yaml` : crée les ConfigMaps avant le déploiement des applications qui en ont besoin au démarrage.
+  3. `20-movie.yaml` puis `30-ticket.yaml` : déploie les Pods et Services une fois les prérequis (namespace, configs) déjà en place dans le cluster.
+
+---
+
+> **Q4.2** — Pendant environ 30 s après le déploiement, les Pods sont `0/1`. Quelle probe est responsable ? Est-ce une anomalie ?
+
+- **Probe responsable :** C'est la **`startupProbe`** (couplée à la `readinessProbe`).
+- **Anomalie ou normal :** Ce n'est **absolument pas une anomalie**. Une application Spring Boot prend généralement 15 à 30 secondes pour initialiser la JVM, charger le contexte applicatif et démarrer son serveur web Tomcat. Durant cette phase d'amorçage, la `startupProbe` effectue des tests (toutes les 2 s) et suspend la `livenessProbe` pour ne pas tuer le conteneur prématurément. Tant que la startupProbe n'a pas réussi et que la readinessProbe n'a pas validé que le service est prêt à recevoir du trafic, le Pod reste temporairement en `0/1 Ready`.
+
+---
+
+> **Q4.3** — Que se passerait-il avec `imagePullPolicy: Always` sur ces images ? Pourquoi ?
+
+- Avec `imagePullPolicy: Always`, le kubelet force la recherche et le téléchargement de l'image depuis un registre distant de conteneurs (par exemple Docker Hub) à chaque création de conteneur, en ignorant le cache local du nœud.
+- Comme `movie-service:1.0.0` et `ticket-service:1.0.0` sont des images locales (construites ou chargées directement dans Minikube) et n'existent pas sur un registre public externe, le pull échouerait systématiquement avec une erreur **`ErrImagePull`** puis **`ImagePullBackOff`**, empêchant les Pods de démarrer.
+- La valeur `IfNotPresent` permet d'utiliser l'image déjà présente localement dans le runtime de Minikube sans tenter d'aller la chercher sur Internet.
 
 ---
 
